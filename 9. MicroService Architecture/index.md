@@ -1038,4 +1038,961 @@ class CircuitBreaker {
     }
     
     try {
-      const result
+      const result = await operation();
+      this.onSuccess();
+      return result;
+    } catch (error) {
+      this.onFailure();
+      throw error;
+    }
+  }
+  
+  onSuccess() {
+    this.failureCount = 0;
+    
+    if (this.state === 'HALF_OPEN') {
+      this.successCount++;
+      
+      // Require multiple successes to fully recover
+      if (this.successCount >= 3) {
+        this.state = 'CLOSED';
+        console.log('Circuit breaker moved to CLOSED state');
+      }
+    }
+  }
+  
+  onFailure() {
+    this.failureCount++;
+    this.lastFailureTime = Date.now();
+    
+    if (this.failureCount >= this.failureThreshold) {
+      this.state = 'OPEN';
+      console.log('Circuit breaker moved to OPEN state');
+    }
+  }
+  
+  startMonitoring() {
+    setInterval(() => {
+      console.log(`Circuit Breaker Status: ${this.state}, Failures: ${this.failureCount}`);
+    }, this.monitoringPeriod);
+  }
+  
+  getState() {
+    return {
+      state: this.state,
+      failureCount: this.failureCount,
+      lastFailureTime: this.lastFailureTime,
+      successCount: this.successCount
+    };
+  }
+}
+
+// Enhanced service client with circuit breaker
+class ResilientServiceClient {
+  constructor(serviceName, options = {}) {
+    this.serviceName = serviceName;
+    this.serviceDiscovery = new ServiceDiscoveryClient(options.registryUrl);
+    this.circuitBreaker = new CircuitBreaker(options.circuitBreaker);
+    this.retryPolicy = options.retryPolicy || { maxRetries: 3, backoffMs: 1000 };
+    this.timeout = options.timeout || 5000;
+  }
+  
+  async request(method, path, data = null) {
+    return await this.circuitBreaker.execute(async () => {
+      return await this.executeWithRetry(async () => {
+        const instance = await this.getServiceInstance();
+        return await this.makeRequest(instance, method, path, data);
+      });
+    });
+  }
+  
+  async getServiceInstance() {
+    const instances = await this.serviceDiscovery.discover(this.serviceName);
+    
+    if (instances.length === 0) {
+      throw new Error(`No instances available for service: ${this.serviceName}`);
+    }
+    
+    // Simple round-robin selection
+    const index = Math.floor(Math.random() * instances.length);
+    return instances[index];
+  }
+  
+  async executeWithRetry(operation) {
+    let lastError;
+    
+    for (let attempt = 1; attempt <= this.retryPolicy.maxRetries; attempt++) {
+      try {
+        return await operation();
+      } catch (error) {
+        lastError = error;
+        
+        // Don't retry on client errors (4xx)
+        if (error.status >= 400 && error.status < 500) {
+          throw error;
+        }
+        
+        if (attempt < this.retryPolicy.maxRetries) {
+          const delay = this.retryPolicy.backoffMs * Math.pow(2, attempt - 1);
+          await this.sleep(delay);
+        }
+      }
+    }
+    
+    throw lastError;
+  }
+  
+  async makeRequest(instance, method, path, data) {
+    const url = `http://${instance.host}:${instance.port}${path}`;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+    
+    try {
+      const response = await fetch(url, {
+        method,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Service-Name': process.env.SERVICE_NAME,
+          'X-Request-ID': this.generateRequestId()
+        },
+        body: data ? JSON.stringify(data) : null,
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) {
+        throw new ServiceError(`HTTP ${response.status}`, response.status);
+      }
+      
+      return await response.json();
+    } catch (error) {
+      clearTimeout(timeoutId);
+      
+      if (error.name === 'AbortError') {
+        throw new ServiceError('Request timeout', 408);
+      }
+      
+      throw error;
+    }
+  }
+  
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+  
+  generateRequestId() {
+    return require('crypto').randomUUID();
+  }
+}
+```
+
+## Data Management in Microservices
+
+### Database per Service Pattern
+
+```javascript
+// User Service Database
+class UserDatabase {
+  constructor() {
+    this.pool = new Pool({
+      host: process.env.USER_DB_HOST,
+      database: 'users_db',
+      user: process.env.DB_USER,
+      password: process.env.DB_PASSWORD
+    });
+  }
+  
+  async createUser(userData) {
+    const client = await this.pool.connect();
+    
+    try {
+      await client.query('BEGIN');
+      
+      // Create user
+      const userResult = await client.query(
+        'INSERT INTO users (email, name, password) VALUES ($1, $2, $3) RETURNING *',
+        [userData.email, userData.name, userData.password]
+      );
+      
+      const user = userResult.rows[0];
+      
+      // Create user profile
+      await client.query(
+        'INSERT INTO user_profiles (user_id, bio, avatar) VALUES ($1, $2, $3)',
+        [user.id, userData.bio || '', userData.avatar || '']
+      );
+      
+      await client.query('COMMIT');
+      return user;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+}
+
+// Order Service Database
+class OrderDatabase {
+  constructor() {
+    this.pool = new Pool({
+      host: process.env.ORDER_DB_HOST,
+      database: 'orders_db',
+      user: process.env.DB_USER,
+      password: process.env.DB_PASSWORD
+    });
+  }
+  
+  async createOrder(orderData) {
+    const client = await this.pool.connect();
+    
+    try {
+      await client.query('BEGIN');
+      
+      // Create order
+      const orderResult = await client.query(
+        'INSERT INTO orders (user_id, total_amount, status) VALUES ($1, $2, $3) RETURNING *',
+        [orderData.userId, orderData.totalAmount, 'pending']
+      );
+      
+      const order = orderResult.rows[0];
+      
+      // Create order items
+      for (const item of orderData.items) {
+        await client.query(
+          'INSERT INTO order_items (order_id, product_id, quantity, price) VALUES ($1, $2, $3, $4)',
+          [order.id, item.productId, item.quantity, item.price]
+        );
+      }
+      
+      await client.query('COMMIT');
+      return order;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+}
+```
+
+### Saga Pattern for Distributed Transactions
+
+```javascript
+// Saga Orchestrator
+class OrderSaga {
+  constructor(services, eventBus) {
+    this.userService = services.userService;
+    this.inventoryService = services.inventoryService;
+    this.paymentService = services.paymentService;
+    this.orderService = services.orderService;
+    this.eventBus = eventBus;
+  }
+  
+  async processOrder(orderData) {
+    const sagaId = require('crypto').randomUUID();
+    const steps = [];
+    
+    try {
+      // Step 1: Validate user
+      console.log(`[${sagaId}] Step 1: Validating user`);
+      const user = await this.userService.getUser(orderData.userId);
+      steps.push({ step: 'validate_user', success: true, data: user });
+      
+      // Step 2: Reserve inventory
+      console.log(`[${sagaId}] Step 2: Reserving inventory`);
+      const reservation = await this.inventoryService.reserveItems(orderData.items);
+      steps.push({ step: 'reserve_inventory', success: true, data: reservation });
+      
+      // Step 3: Process payment
+      console.log(`[${sagaId}] Step 3: Processing payment`);
+      const payment = await this.paymentService.processPayment({
+        userId: orderData.userId,
+        amount: orderData.totalAmount,
+        orderId: sagaId
+      });
+      steps.push({ step: 'process_payment', success: true, data: payment });
+      
+      // Step 4: Create order
+      console.log(`[${sagaId}] Step 4: Creating order`);
+      const order = await this.orderService.createOrder({
+        ...orderData,
+        sagaId,
+        paymentId: payment.id,
+        reservationId: reservation.id
+      });
+      steps.push({ step: 'create_order', success: true, data: order });
+      
+      // Step 5: Confirm inventory reservation
+      console.log(`[${sagaId}] Step 5: Confirming inventory`);
+      await this.inventoryService.confirmReservation(reservation.id);
+      steps.push({ step: 'confirm_inventory', success: true });
+      
+      // Publish success event
+      await this.eventBus.publish('order.saga.completed', {
+        sagaId,
+        orderId: order.id,
+        steps
+      });
+      
+      return order;
+      
+    } catch (error) {
+      console.error(`[${sagaId}] Saga failed at step ${steps.length + 1}:`, error);
+      
+      // Compensate (rollback) completed steps
+      await this.compensate(sagaId, steps);
+      
+      // Publish failure event
+      await this.eventBus.publish('order.saga.failed', {
+        sagaId,
+        error: error.message,
+        steps
+      });
+      
+      throw error;
+    }
+  }
+  
+  async compensate(sagaId, completedSteps) {
+    console.log(`[${sagaId}] Starting compensation for ${completedSteps.length} steps`);
+    
+    // Compensate in reverse order
+    for (let i = completedSteps.length - 1; i >= 0; i--) {
+      const step = completedSteps[i];
+      
+      try {
+        await this.compensateStep(sagaId, step);
+        console.log(`[${sagaId}] Compensated step: ${step.step}`);
+      } catch (error) {
+        console.error(`[${sagaId}] Compensation failed for step ${step.step}:`, error);
+        // Continue with other compensations
+      }
+    }
+  }
+  
+  async compensateStep(sagaId, step) {
+    switch (step.step) {
+      case 'reserve_inventory':
+        await this.inventoryService.cancelReservation(step.data.id);
+        break;
+        
+      case 'process_payment':
+        await this.paymentService.refundPayment(step.data.id);
+        break;
+        
+      case 'create_order':
+        await this.orderService.cancelOrder(step.data.id);
+        break;
+        
+      case 'confirm_inventory':
+        // This is complex - may need to create new reservation to cancel
+        await this.inventoryService.restoreItems(step.data.items);
+        break;
+        
+      default:
+        console.log(`No compensation needed for step: ${step.step}`);
+    }
+  }
+}
+
+// Event-driven Saga (Choreography)
+class EventDrivenSaga {
+  constructor(eventBus) {
+    this.eventBus = eventBus;
+    this.sagaStates = new Map(); // In production, use persistent storage
+    this.setupEventHandlers();
+  }
+  
+  setupEventHandlers() {
+    this.eventBus.subscribe('order.created', this.handleOrderCreated.bind(this));
+    this.eventBus.subscribe('inventory.reserved', this.handleInventoryReserved.bind(this));
+    this.eventBus.subscribe('inventory.reservation.failed', this.handleInventoryFailed.bind(this));
+    this.eventBus.subscribe('payment.processed', this.handlePaymentProcessed.bind(this));
+    this.eventBus.subscribe('payment.failed', this.handlePaymentFailed.bind(this));
+  }
+  
+  async handleOrderCreated(orderData) {
+    const sagaId = orderData.orderId;
+    
+    this.sagaStates.set(sagaId, {
+      orderId: orderData.orderId,
+      userId: orderData.userId,
+      items: orderData.items,
+      totalAmount: orderData.totalAmount,
+      step: 'order_created',
+      createdAt: new Date()
+    });
+    
+    // Trigger inventory reservation
+    await this.eventBus.publish('inventory.reserve', {
+      sagaId,
+      orderId: orderData.orderId,
+      items: orderData.items
+    });
+  }
+  
+  async handleInventoryReserved(data) {
+    const saga = this.sagaStates.get(data.sagaId);
+    if (!saga) return;
+    
+    saga.step = 'inventory_reserved';
+    saga.reservationId = data.reservationId;
+    
+    // Trigger payment processing
+    await this.eventBus.publish('payment.process', {
+      sagaId: data.sagaId,
+      orderId: saga.orderId,
+      userId: saga.userId,
+      amount: saga.totalAmount
+    });
+  }
+  
+  async handleInventoryFailed(data) {
+    const saga = this.sagaStates.get(data.sagaId);
+    if (!saga) return;
+    
+    // Cancel order
+    await this.eventBus.publish('order.cancel', {
+      orderId: saga.orderId,
+      reason: 'Inventory not available'
+    });
+    
+    this.sagaStates.delete(data.sagaId);
+  }
+  
+  async handlePaymentProcessed(data) {
+    const saga = this.sagaStates.get(data.sagaId);
+    if (!saga) return;
+    
+    saga.step = 'payment_processed';
+    saga.paymentId = data.paymentId;
+    
+    // Confirm order and inventory
+    await this.eventBus.publish('order.confirm', {
+      orderId: saga.orderId,
+      paymentId: data.paymentId
+    });
+    
+    await this.eventBus.publish('inventory.confirm', {
+      reservationId: saga.reservationId
+    });
+    
+    this.sagaStates.delete(data.sagaId);
+  }
+  
+  async handlePaymentFailed(data) {
+    const saga = this.sagaStates.get(data.sagaId);
+    if (!saga) return;
+    
+    // Cancel reservation and order
+    await this.eventBus.publish('inventory.cancel', {
+      reservationId: saga.reservationId
+    });
+    
+    await this.eventBus.publish('order.cancel', {
+      orderId: saga.orderId,
+      reason: 'Payment failed'
+    });
+    
+    this.sagaStates.delete(data.sagaId);
+  }
+}
+```
+
+## Monitoring and Observability
+
+```javascript
+// Distributed Tracing
+const opentelemetry = require('@opentelemetry/api');
+const { NodeTracerProvider } = require('@opentelemetry/sdk-node');
+const { Resource } = require('@opentelemetry/resources');
+const { SemanticResourceAttributes } = require('@opentelemetry/semantic-conventions');
+
+class DistributedTracing {
+  constructor(serviceName) {
+    this.serviceName = serviceName;
+    this.setupTracing();
+  }
+  
+  setupTracing() {
+    const provider = new NodeTracerProvider({
+      resource: new Resource({
+        [SemanticResourceAttributes.SERVICE_NAME]: this.serviceName,
+        [SemanticResourceAttributes.SERVICE_VERSION]: process.env.SERVICE_VERSION || '1.0.0',
+      }),
+    });
+    
+    provider.register();
+    this.tracer = opentelemetry.trace.getTracer(this.serviceName);
+  }
+  
+  traceRequest(operationName, req, res, next) {
+    const span = this.tracer.startSpan(operationName, {
+      kind: opentelemetry.SpanKind.SERVER,
+      attributes: {
+        'http.method': req.method,
+        'http.url': req.url,
+        'http.user_agent': req.get('User-Agent'),
+        'user.id': req.user?.id
+      }
+    });
+    
+    // Add span to request context
+    req.span = span;
+    
+    // Override res.end to finish span
+    const originalEnd = res.end;
+    res.end = function(...args) {
+      span.setAttributes({
+        'http.status_code': res.statusCode,
+        'http.response_size': res.get('content-length') || 0
+      });
+      
+      if (res.statusCode >= 400) {
+        span.recordException(new Error(`HTTP ${res.statusCode}`));
+        span.setStatus({
+          code: opentelemetry.SpanStatusCode.ERROR,
+          message: `HTTP ${res.statusCode}`
+        });
+      }
+      
+      span.end();
+      originalEnd.apply(this, args);
+    };
+    
+    next();
+  }
+  
+  traceServiceCall(serviceName, operation, fn) {
+    return async (...args) => {
+      const span = this.tracer.startSpan(`${serviceName}.${operation}`, {
+        kind: opentelemetry.SpanKind.CLIENT,
+        attributes: {
+          'service.name': serviceName,
+          'operation.name': operation
+        }
+      });
+      
+      try {
+        const result = await fn(...args);
+        span.setStatus({ code: opentelemetry.SpanStatusCode.OK });
+        return result;
+      } catch (error) {
+        span.recordException(error);
+        span.setStatus({
+          code: opentelemetry.SpanStatusCode.ERROR,
+          message: error.message
+        });
+        throw error;
+      } finally {
+        span.end();
+      }
+    };
+  }
+}
+
+// Metrics Collection
+class MetricsCollector {
+  constructor(serviceName) {
+    this.serviceName = serviceName;
+    this.metrics = {
+      requestCount: 0,
+      responseTime: [],
+      errorCount: 0,
+      activeConnections: 0
+    };
+    
+    this.startCollection();
+  }
+  
+  recordRequest(req, res, responseTime) {
+    this.metrics.requestCount++;
+    this.metrics.responseTime.push(responseTime);
+    
+    // Keep only last 1000 response times
+    if (this.metrics.responseTime.length > 1000) {
+      this.metrics.responseTime.shift();
+    }
+    
+    if (res.statusCode >= 400) {
+      this.metrics.errorCount++;
+    }
+  }
+  
+  incrementConnections() {
+    this.metrics.activeConnections++;
+  }
+  
+  decrementConnections() {
+    this.metrics.activeConnections--;
+  }
+  
+  getMetrics() {
+    const responseTime = this.metrics.responseTime;
+    const avgResponseTime = responseTime.length > 0 
+      ? responseTime.reduce((a, b) => a + b, 0) / responseTime.length 
+      : 0;
+    
+    const p95ResponseTime = responseTime.length > 0
+      ? responseTime.sort((a, b) => a - b)[Math.floor(responseTime.length * 0.95)]
+      : 0;
+    
+    return {
+      service: this.serviceName,
+      timestamp: new Date().toISOString(),
+      requests: {
+        total: this.metrics.requestCount,
+        errors: this.metrics.errorCount,
+        errorRate: this.metrics.requestCount > 0 
+          ? (this.metrics.errorCount / this.metrics.requestCount * 100).toFixed(2) + '%' 
+          : '0%'
+      },
+      responseTime: {
+        average: avgResponseTime.toFixed(2) + 'ms',
+        p95: p95ResponseTime.toFixed(2) + 'ms'
+      },
+      connections: this.metrics.activeConnections
+    };
+  }
+  
+  startCollection() {
+    // Export metrics every 30 seconds
+    setInterval(() => {
+      const metrics = this.getMetrics();
+      console.log('📊 Metrics:', metrics);
+      
+      // Send to metrics aggregation service
+      this.exportMetrics(metrics);
+    }, 30000);
+  }
+  
+  async exportMetrics(metrics) {
+    try {
+      // Send to Prometheus, DataDog, or other monitoring system
+      await fetch(process.env.METRICS_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(metrics)
+      });
+    } catch (error) {
+      console.error('Failed to export metrics:', error);
+    }
+  }
+  
+  // Middleware for Express
+  middleware() {
+    return (req, res, next) => {
+      const start = Date.now();
+      this.incrementConnections();
+      
+      res.on('finish', () => {
+        const responseTime = Date.now() - start;
+        this.recordRequest(req, res, responseTime);
+        this.decrementConnections();
+      });
+      
+      next();
+    };
+  }
+}
+
+// Health Check System
+class HealthCheckManager {
+  constructor() {
+    this.checks = new Map();
+    this.dependencies = [];
+  }
+  
+  addCheck(name, checkFunction, options = {}) {
+    this.checks.set(name, {
+      check: checkFunction,
+      timeout: options.timeout || 5000,
+      critical: options.critical !== false
+    });
+  }
+  
+  addDependency(serviceName, healthUrl) {
+    this.dependencies.push({ serviceName, healthUrl });
+  }
+  
+  async runHealthChecks() {
+    const results = {
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      checks: {},
+      dependencies: {}
+    };
+    
+    // Run internal health checks
+    for (const [name, config] of this.checks) {
+      try {
+        const checkPromise = config.check();
+        const timeoutPromise = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Health check timeout')), config.timeout)
+        );
+        
+        await Promise.race([checkPromise, timeoutPromise]);
+        
+        results.checks[name] = {
+          status: 'healthy',
+          timestamp: new Date().toISOString()
+        };
+      } catch (error) {
+        results.checks[name] = {
+          status: 'unhealthy',
+          error: error.message,
+          timestamp: new Date().toISOString()
+        };
+        
+        if (config.critical) {
+          results.status = 'unhealthy';
+        }
+      }
+    }
+    
+    // Check dependencies
+    await Promise.all(
+      this.dependencies.map(async (dep) => {
+        try {
+          const response = await fetch(dep.healthUrl, { timeout: 3000 });
+          
+          results.dependencies[dep.serviceName] = {
+            status: response.ok ? 'healthy' : 'unhealthy',
+            statusCode: response.status,
+            timestamp: new Date().toISOString()
+          };
+        } catch (error) {
+          results.dependencies[dep.serviceName] = {
+            status: 'unhealthy',
+            error: error.message,
+            timestamp: new Date().toISOString()
+          };
+        }
+      })
+    );
+    
+    return results;
+  }
+  
+  createHealthEndpoint() {
+    return async (req, res) => {
+      try {
+        const health = await this.runHealthChecks();
+        const statusCode = health.status === 'healthy' ? 200 : 503;
+        res.status(statusCode).json(health);
+      } catch (error) {
+        res.status(500).json({
+          status: 'unhealthy',
+          error: error.message,
+          timestamp: new Date().toISOString()
+        });
+      }
+    };
+  }
+}
+```
+
+## Container Orchestration with Docker and Kubernetes
+
+```dockerfile
+# Dockerfile for Node.js microservice
+FROM node:18-alpine AS builder
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm ci --only=production && npm cache clean --force
+
+# Copy source code
+COPY . .
+
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001
+
+# Production stage
+FROM node:18-alpine AS production
+
+WORKDIR /app
+
+# Copy from builder stage
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app .
+
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001
+
+# Change ownership
+RUN chown -R nodejs:nodejs /app
+USER nodejs
+
+# Expose port
+EXPOSE 3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD node healthcheck.js
+
+# Start the application
+CMD ["node", "app.js"]
+```
+
+```yaml
+# Kubernetes deployment manifest
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  labels:
+    app: user-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: user-service
+  template:
+    metadata:
+      labels:
+        app: user-service
+    spec:
+      containers:
+      - name: user-service
+        image: user-service:latest
+        ports:
+        - containerPort: 3000
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: DB_HOST
+          valueFrom:
+            secretKeyRef:
+              name: user-service-secrets
+              key: db-host
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: user-service-secrets
+              key: db-password
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+spec:
+  selector:
+    app: user-service
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 3000
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: user-service-config
+data:
+  LOG_LEVEL: "info"
+  CACHE_TTL: "3600"
+  MAX_CONNECTIONS: "100"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: user-service-secrets
+type: Opaque
+data:
+  db-host: <base64-encoded-host>
+  db-password: <base64-encoded-password>
+  jwt-secret: <base64-encoded-jwt-secret>
+```
+
+## Best Practices Summary
+
+### ✅ Microservices Best Practices:
+
+```javascript
+// 1. Single Responsibility Principle
+class UserService {
+  // Only handles user-related operations
+  async createUser(userData) { /* ... */ }
+  async getUser(id) { /* ... */ }
+  async updateUser(id, data) { /* ... */ }
+}
+
+// 2. Database per Service
+// Each service has its own database
+const userDb = new UserDatabase();
+const orderDb = new OrderDatabase();
+
+// 3. API Versioning
+app.use('/api/v1/users', userRoutesV1);
+app.use('/api/v2/users', userRoutesV2);
+
+// 4. Circuit Breaker Pattern
+const userServiceClient = new ResilientServiceClient('user-service', {
+  circuitBreaker: { failureThreshold: 5, recoveryTimeout: 30000 }
+});
+
+// 5. Event-Driven Communication
+eventBus.publish('user.created', userData);
+eventBus.subscribe('order.created', handleOrderCreated);
+```
+
+### ❌ Common Pitfalls:
+
+```javascript
+// 1. ❌ Distributed Monolith
+// Services that are too tightly coupled
+await userService.createUser(data);
+await profileService.createProfile(data); // Direct coupling
+await notificationService.sendWelcome(data); // Chain of dependencies
+
+// 2. ❌ Shared Database
+// Multiple services accessing the same database
+const sharedDb = new Database(); // AVOID THIS
+
+// 3. ❌ Synchronous Communication Everywhere
+// Over-reliance on synchronous calls
+const user = await userService.getUser(id); // Can create cascade failures
+const orders = await orderService.getUserOrders(id);
+const payments = await paymentService.getUserPayments(id);
+
+// 4. ❌ No Error Handling
+await externalService.call(); // What if it fails?
+
+// 5. ❌ Missing Monitoring
+// No observability into system behavior
+```
+
+Microservices architecture enables scalability and maintainability but requires careful design, robust error handling, and comprehensive monitoring to be successful in production environments!
